@@ -315,7 +315,15 @@ async def run_agent(
                 yield {"type": "tool_call", "name": fn_name, "input": fn_args}
 
                 try:
-                    raw = _dispatch(fn_name, fn_args)
+                    # _dispatch does blocking I/O (GCS, yfinance, requests) — run it
+                    # off the event loop so a slow tool call doesn't freeze every
+                    # other concurrent request on this worker, and cap it so a stuck
+                    # call fails the request instead of hanging the SSE stream forever.
+                    raw = await asyncio.wait_for(
+                        asyncio.to_thread(_dispatch, fn_name, fn_args), timeout=45
+                    )
+                except asyncio.TimeoutError:
+                    raw = f"Error: {fn_name} timed out after 45s"
                 except Exception as exc:
                     raw = f"Error: {exc}"
 

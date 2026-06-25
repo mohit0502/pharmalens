@@ -21,6 +21,7 @@ Environment variables (all optional in dev):
 
 import os
 import time
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 from agents.logger import get_logger
@@ -180,7 +181,14 @@ def list_wiki(prefix: str = "") -> list[str]:
 
 
 def search_wiki(query: str, prefix: str = "") -> list[dict]:
-    """Full-text search across wiki pages. Returns [{path, snippet}] up to 20 matches."""
+    """Full-text search across wiki pages. Returns [{path, snippet}] up to 20 matches.
+
+    A query with no literal match anywhere in the wiki (common — the Q&A agent
+    sometimes searches for things that simply aren't in any page, e.g. transient
+    stock-price commentary) can't early-exit on the 20-match cap, so it always
+    has to read every page. In production that's hundreds of GCS round-trips;
+    done serially this took minutes and looked indistinguishable from a hang.
+    Read them concurrently instead."""
     query_lower = query.lower()
     results: list[dict] = []
 
@@ -188,8 +196,13 @@ def search_wiki(query: str, prefix: str = "") -> list[dict]:
         # Route through list_wiki()/read_wiki() instead of raw blob calls — both
         # are cached, so a repeated search (or a search after a recent read/list)
         # mostly hits memory instead of GCS.
-        for rel in list_wiki(prefix):
-            content = read_wiki(rel)
+        # 40 workers measured fastest against the real bucket (~11s for a full
+        # 2768-page scan) — higher counts (e.g. 100) were *slower*, likely from
+        # contention on the GCS client's underlying connection pool.
+        paths = list_wiki(prefix)
+        with ThreadPoolExecutor(max_workers=40) as pool:
+            contents = pool.map(read_wiki, paths)
+        for rel, content in zip(paths, contents):
             if not content or query_lower not in content.lower():
                 continue
             _append_snippet(results, rel, content, query_lower)
