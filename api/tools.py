@@ -9,9 +9,19 @@ import time
 import yfinance as yf
 import yaml
 from agents.wiki_gcs import read_wiki, list_wiki, search_wiki as _search_wiki, read_company_events
+from .news import COMPANIES
 
 _STOCK_CACHE_TTL_SECONDS = 20
 _stock_cache: dict[str, tuple[float, dict]] = {}
+
+_HISTORY_INTERVAL = {"1d": "5m", "5d": "30m", "1mo": "1d", "1y": "1d"}
+
+
+def resolve_ticker(company_slug: str) -> str | None:
+    """Look up a company's ticker from reference/companies.json. Lets callers
+    (the Q&A agent in particular) work with the same company slugs used
+    everywhere else in the app instead of needing to already know tickers."""
+    return COMPANIES.get(company_slug, {}).get("ticker")
 
 
 def normalize_status(raw: str) -> str:
@@ -143,3 +153,50 @@ def get_stock_price(ticker: str) -> dict:
         result = {"ticker": ticker, "price": None, "error": str(e)}
     _stock_cache[ticker] = (time.time(), result)
     return result
+
+
+def get_stock_history(company_slug: str, period: str = "1mo") -> dict:
+    """Historical OHLCV + a compact summary (start/end price, period high/low,
+    % change) for a company's ticker. period: 1d | 5d | 1mo | 1y. The summary
+    fields exist so the Q&A agent can answer "why did the price move" questions
+    without needing to eyeball a full candle list itself."""
+    ticker = resolve_ticker(company_slug)
+    if not ticker:
+        return {"error": f"Unknown company slug: {company_slug}"}
+
+    interval = _HISTORY_INTERVAL.get(period, "1d")
+    try:
+        df = yf.Ticker(ticker).history(period=period, interval=interval)
+        stock = get_stock_price(ticker)
+        prev_close = (
+            round(stock["price"] - stock["change"], 4)
+            if stock.get("price") is not None
+            else None
+        )
+
+        candles = [
+            {
+                "t": str(idx),
+                "o": round(row.Open, 4),
+                "h": round(row.High, 4),
+                "l": round(row.Low, 4),
+                "c": round(row.Close, 4),
+                "v": int(row.Volume),
+            }
+            for idx, row in df.iterrows()
+        ]
+
+        closes = [c["c"] for c in candles]
+        summary = {
+            "start_price": closes[0] if closes else None,
+            "end_price": closes[-1] if closes else None,
+            "pct_change_over_period": (
+                round((closes[-1] / closes[0] - 1) * 100, 2) if len(closes) >= 2 and closes[0] else None
+            ),
+            "period_high": max((c["h"] for c in candles), default=None),
+            "period_low": min((c["l"] for c in candles), default=None),
+        }
+
+        return {"ticker": ticker, "period": period, "prev_close": prev_close, "summary": summary, "candles": candles}
+    except Exception as e:
+        return {"ticker": ticker, "period": period, "error": str(e)}

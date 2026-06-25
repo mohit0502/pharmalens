@@ -20,7 +20,10 @@ from google import genai
 from google.genai import types
 
 from . import news
-from .tools import read_wiki_page, list_wiki_pages, get_stock_price, search_wiki, parse_company_trials
+from .tools import (
+    read_wiki_page, list_wiki_pages, get_stock_price, get_stock_history,
+    search_wiki, parse_company_trials, resolve_ticker,
+)
 
 load_dotenv()
 
@@ -42,8 +45,9 @@ Instructions:
 2. When you don't know the exact path (e.g. looking for an earnings event, NCT number, or specific drug mention), use search_wiki first — it returns matching file paths and snippets so you can then read_wiki_page the right file.
 3. For any question about a company's clinical trials (which trials, which indications, dates, status, results), use get_company_trials instead of read_wiki_page on trials/<company>.md — that file can hold 50+ trials and gets cut off well before recent ones, while get_company_trials returns the full structured list pre-sorted newest-first.
 4. Quote specific numbers, dates, and drug names from the wiki — do not hallucinate.
-5. For live stock data, call get_stock_price with the company's ticker (e.g. NVO, LLY).
-6. Be concise. One short paragraph per topic; bullet points for lists.
+5. All stock/news tools take a company_slug (e.g. 'eli-lilly', 'novo-nordisk') — you never need to know or ask for a ticker symbol.
+6. For "why did X happen" or "why did the stock move" questions, or anything else time-sensitive, gather both data and recent news before answering (e.g. get_stock_history for the price trajectory plus get_company_news for the catalysts behind it) — static wiki pages describe the pipeline and fundamentals, not what happened this week.
+7. Be concise. One short paragraph per topic; bullet points for lists.
 """
 
 # ── Gemini tool declarations ──────────────────────────────────────────────────
@@ -88,16 +92,65 @@ TOOL_DECLARATIONS = types.Tool(
         ),
         types.FunctionDeclaration(
             name="get_stock_price",
-            description="Get the current stock price, change, and % change for a ticker symbol.",
+            description=(
+                "Get a company's current stock price, change, and % change vs. the "
+                "previous close — a single live snapshot, not a trend. Use "
+                "get_stock_history instead if the question is about movement over "
+                "time (e.g. 'how has it moved this month')."
+            ),
             parameters=types.Schema(
                 type=types.Type.OBJECT,
                 properties={
-                    "ticker": types.Schema(
+                    "company_slug": types.Schema(
                         type=types.Type.STRING,
-                        description="NYSE/NASDAQ ticker, e.g. 'NVO', 'LLY', 'MRK'",
+                        description="Company slug, e.g. 'eli-lilly', 'novo-nordisk'",
                     )
                 },
-                required=["ticker"],
+                required=["company_slug"],
+            ),
+        ),
+        types.FunctionDeclaration(
+            name="get_stock_history",
+            description=(
+                "Get a company's price trajectory over a period — start/end price, "
+                "% change, period high/low, plus the underlying candles. Use this "
+                "for any 'how/why has the stock moved' question; pair it with "
+                "get_company_news to explain *why* it moved, since this tool only "
+                "has the price data, not the catalysts behind it."
+            ),
+            parameters=types.Schema(
+                type=types.Type.OBJECT,
+                properties={
+                    "company_slug": types.Schema(
+                        type=types.Type.STRING,
+                        description="Company slug, e.g. 'eli-lilly', 'novo-nordisk'",
+                    ),
+                    "period": types.Schema(
+                        type=types.Type.STRING,
+                        description="One of '1d', '5d', '1mo', '1y'. Defaults to '1mo'.",
+                    ),
+                },
+                required=["company_slug"],
+            ),
+        ),
+        types.FunctionDeclaration(
+            name="get_company_news",
+            description=(
+                "Get recent news for a company from the last 7 days, combining BioSpace "
+                "and Yahoo Finance — deals, trial readouts, FDA actions, earnings reactions, "
+                "analyst notes. Use this for anything time-sensitive: 'what's happening with "
+                "X', 'why did the stock move', 'any recent news'. The static wiki pages "
+                "describe pipeline/fundamentals and won't have this week's events."
+            ),
+            parameters=types.Schema(
+                type=types.Type.OBJECT,
+                properties={
+                    "company_slug": types.Schema(
+                        type=types.Type.STRING,
+                        description="Company slug, e.g. 'eli-lilly', 'novo-nordisk'",
+                    )
+                },
+                required=["company_slug"],
             ),
         ),
         types.FunctionDeclaration(
@@ -157,7 +210,16 @@ def _dispatch(name: str, args: dict) -> str:
         result = list_wiki_pages(args.get("prefix", ""))
         return json.dumps(result)
     if name == "get_stock_price":
-        result = get_stock_price(args.get("ticker", ""))
+        slug = args.get("company_slug", "")
+        ticker = resolve_ticker(slug)
+        if not ticker:
+            return json.dumps({"error": f"Unknown company slug: {slug}"})
+        return json.dumps(get_stock_price(ticker))
+    if name == "get_stock_history":
+        result = get_stock_history(args.get("company_slug", ""), args.get("period", "1mo"))
+        return json.dumps(result)
+    if name == "get_company_news":
+        result = news.get_company_news(args.get("company_slug", ""))
         return json.dumps(result)
     if name == "search_wiki":
         result = search_wiki(args.get("query", ""), args.get("prefix", ""))

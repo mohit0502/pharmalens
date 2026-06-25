@@ -186,52 +186,23 @@ def get_company(slug: str) -> dict:
 
 
 @app.get("/api/company/{slug}/stock-history")
-def get_stock_history(slug: str, period: str = "1d") -> dict:
+def get_stock_history_route(slug: str, period: str = "1d") -> dict:
     """
     Historical OHLCV data for the company's ticker via yfinance.
     period: 1d | 5d | 1mo | 1y
-    Returns {ticker, prev_close, candles: [{t,o,h,l,c,v}]}
+    Returns {ticker, prev_close, summary, candles: [{t,o,h,l,c,v}]}
     """
-    from .tools import get_stock_price
-    import yfinance as yf
+    from .tools import get_stock_history
 
     if slug not in COMPANIES:
         raise HTTPException(status_code=404, detail=f"Company '{slug}' not found")
-
-    ticker = COMPANIES[slug].get("ticker", "")
-    if not ticker:
+    if not COMPANIES[slug].get("ticker"):
         raise HTTPException(status_code=404, detail="No ticker for this company")
 
-    _INTERVAL = {"1d": "5m", "5d": "30m", "1mo": "1d", "1y": "1d"}
-    interval = _INTERVAL.get(period, "1d")
-
-    try:
-        t   = yf.Ticker(ticker)
-        df  = t.history(period=period, interval=interval)
-        # Reuse get_stock_price's cached fast_info instead of a second fast_info
-        # round-trip — the company page and this chart both load on every page
-        # open, and price - change recovers prev_close without re-fetching it.
-        stock = get_stock_price(ticker)
-        prev_close = (
-            round(stock["price"] - stock["change"], 4)
-            if stock.get("price") is not None
-            else None
-        )
-
-        candles = [
-            {
-                "t": str(idx),
-                "o": round(row.Open,  4),
-                "h": round(row.High,  4),
-                "l": round(row.Low,   4),
-                "c": round(row.Close, 4),
-                "v": int(row.Volume),
-            }
-            for idx, row in df.iterrows()
-        ]
-        return {"ticker": ticker, "prev_close": prev_close, "candles": candles}
-    except Exception as e:
-        raise HTTPException(status_code=502, detail=str(e))
+    result = get_stock_history(slug, period)
+    if "error" in result:
+        raise HTTPException(status_code=502, detail=result["error"])
+    return result
 
 
 def _normalize_status(raw: str) -> str:
