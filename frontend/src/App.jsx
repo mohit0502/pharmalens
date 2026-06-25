@@ -91,6 +91,14 @@ export default function App() {
     return () => clearInterval(interval)
   }, [])
 
+  const selectArticle = url => { setActiveArticle(url); setActiveIndication(null); setActiveCompany(null) }
+
+  // Sidebar feed only shows the last 24h — articles get scraped daily, so an
+  // unbounded list would just grow forever; the per-company teaser below
+  // covers older news on a company's own page instead.
+  const dayAgo = Date.now() - 24 * 60 * 60 * 1000
+  const recentNews = news.filter(a => new Date(a.published_date).getTime() >= dayAgo)
+
   return (
     <div className="app-wrapper">
       <TickerBar stocks={Object.values(stocks)} />
@@ -98,13 +106,13 @@ export default function App() {
         <Sidebar
           indications={indications}
           companies={companies}
-          news={news}
+          news={recentNews}
           activeIndication={activeIndication}
           activeCompany={activeCompany}
           activeArticle={activeArticle}
           onSelectIndication={slug => { setActiveIndication(slug); setActiveCompany(null); setActiveArticle(null) }}
           onSelectCompany={slug => { setActiveCompany(slug); setActiveIndication(null); setActiveArticle(null) }}
-          onSelectArticle={url => { setActiveArticle(url); setActiveIndication(null); setActiveCompany(null) }}
+          onSelectArticle={selectArticle}
         />
         <ResizeHandle width={sidebarWidth} setWidth={setSidebarWidth} clamp={clampSidebar} direction={1} />
         <main className="main">
@@ -122,6 +130,8 @@ export default function App() {
               key={activeCompany}
               slug={activeCompany}
               stocks={stocks}
+              news={news}
+              onSelectArticle={selectArticle}
               onSelectIndication={slug => { setActiveIndication(slug); setActiveCompany(null) }}
             />
           )}

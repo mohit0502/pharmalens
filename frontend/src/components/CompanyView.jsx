@@ -5,7 +5,7 @@ import TrialsPanel from './TrialsPanel'
 import StockChart from './StockChart'
 
 
-export default function CompanyView({ slug, onSelectIndication }) {
+export default function CompanyView({ slug, onSelectIndication, news = [], onSelectArticle }) {
   const [data, setData] = useState(null)
   const [events, setEvents] = useState([])
   const [loading, setLoading] = useState(true)
@@ -22,6 +22,8 @@ export default function CompanyView({ slug, onSelectIndication }) {
   if (!data) return null
 
   const { meta, stock, drug_indications = {} } = data
+  // news is pre-sorted newest-first by the backend
+  const latestNews = news.find(a => a.companies?.includes(slug))
   const secEvents         = events.filter(e => e.type === 'sec')
   const researchEvents    = events.filter(e => e.type === 'research')
   const oneYearAgo        = new Date(); oneYearAgo.setFullYear(oneYearAgo.getFullYear() - 1)
@@ -58,6 +60,23 @@ export default function CompanyView({ slug, onSelectIndication }) {
           )}
         </div>
       </div>
+
+      {/* Latest news teaser — title + date only, full text lives in the article view */}
+      {latestNews && (
+        <div
+          className="card"
+          style={{ marginBottom: 10, cursor: onSelectArticle ? 'pointer' : 'default' }}
+          onClick={() => onSelectArticle?.(latestNews.url)}
+        >
+          <p className="sec-label" style={{ marginBottom: 6 }}>Latest news</p>
+          <div className="co-row">
+            <div>
+              <div className="evt-date">{latestNews.published_date?.slice(0, 10)} · BioSpace</div>
+              <div className="co-name">{latestNews.title}</div>
+            </div>
+          </div>
+        </div>
+      )}
 
       {/* Stock chart */}
       {meta.ticker && (
