@@ -47,6 +47,11 @@ export async function fetchNews() {
   return r.json()
 }
 
+export async function fetchCompanyNews(slug) {
+  const r = await fetch(`${BASE}/api/company/${slug}/news`)
+  return r.json()
+}
+
 export async function fetchArticle(url) {
   const r = await fetch(`${BASE}/api/news/article?url=${encodeURIComponent(url)}`)
   return r.json()

@@ -130,7 +130,6 @@ export default function App() {
               key={activeCompany}
               slug={activeCompany}
               stocks={stocks}
-              news={news}
               onSelectArticle={selectArticle}
               onSelectIndication={slug => { setActiveIndication(slug); setActiveCompany(null) }}
             />

@@ -1,29 +1,38 @@
 import { useState, useEffect } from 'react'
-import { fetchCompany, fetchCompanyEvents } from '../api'
+import { fetchCompany, fetchCompanyEvents, fetchCompanyNews } from '../api'
 import { eventColor } from '../parseWiki'
 import TrialsPanel from './TrialsPanel'
 import StockChart from './StockChart'
 
+function timeAgo(isoDate) {
+  const ms = Date.now() - new Date(isoDate).getTime()
+  const hours = Math.round(ms / 3_600_000)
+  if (hours < 1) return 'just now'
+  if (hours < 24) return `${hours} hour${hours === 1 ? '' : 's'} ago`
+  const days = Math.round(hours / 24)
+  return `${days} day${days === 1 ? '' : 's'} ago`
+}
 
-export default function CompanyView({ slug, onSelectIndication, news = [], onSelectArticle }) {
+export default function CompanyView({ slug, onSelectIndication, onSelectArticle }) {
   const [data, setData] = useState(null)
   const [events, setEvents] = useState([])
+  const [companyNews, setCompanyNews] = useState([])
   const [loading, setLoading] = useState(true)
 
   useEffect(() => {
     setLoading(true)
     setData(null)
     setEvents([])
+    setCompanyNews([])
     fetchCompany(slug).then(d => { setData(d); setLoading(false) })
     fetchCompanyEvents(slug).then(d => setEvents(d.events ?? []))
+    fetchCompanyNews(slug).then(d => setCompanyNews(d.articles ?? []))
   }, [slug])
 
   if (loading) return <div className="loading">Loading {slug}…</div>
   if (!data) return null
 
   const { meta, stock, drug_indications = {} } = data
-  // news is pre-sorted newest-first by the backend
-  const latestNews = news.find(a => a.companies?.includes(slug))
   const secEvents         = events.filter(e => e.type === 'sec')
   const researchEvents    = events.filter(e => e.type === 'research')
   const oneYearAgo        = new Date(); oneYearAgo.setFullYear(oneYearAgo.getFullYear() - 1)
@@ -61,27 +70,33 @@ export default function CompanyView({ slug, onSelectIndication, news = [], onSel
         </div>
       </div>
 
-      {/* Latest news teaser — title + date only, full text lives in the article view */}
-      {latestNews && (
-        <div
-          className="card"
-          style={{ marginBottom: 10, cursor: onSelectArticle ? 'pointer' : 'default' }}
-          onClick={() => onSelectArticle?.(latestNews.url)}
-        >
-          <p className="sec-label" style={{ marginBottom: 6 }}>Latest news</p>
-          <div className="co-row">
-            <div>
-              <div className="evt-date">{latestNews.published_date?.slice(0, 10)} · BioSpace</div>
-              <div className="co-name">{latestNews.title}</div>
-            </div>
-          </div>
-        </div>
-      )}
-
       {/* Stock chart */}
       {meta.ticker && (
         <div className="card" style={{ marginBottom: 10 }}>
           <StockChart slug={slug} />
+        </div>
+      )}
+
+      {/* News stories — BioSpace + yfinance, last 7 days, title/source/time only;
+          full text + chat lives in the article view (BioSpace links only — other
+          sources don't have a reader, so those open externally). */}
+      {companyNews.length > 0 && (
+        <div className="card" style={{ marginBottom: 10 }}>
+          <p className="sec-label" style={{ marginBottom: 4 }}>News stories</p>
+          <div className="news-grid">
+            {companyNews.map(article => {
+              const isBioSpace = article.source === 'BioSpace'
+              const onClick = () => isBioSpace
+                ? onSelectArticle?.(article.url)
+                : window.open(article.url, '_blank', 'noopener,noreferrer')
+              return (
+                <div key={article.url} className="news-item" onClick={onClick}>
+                  <div className="evt-date">{article.source} · {timeAgo(article.published_date)}</div>
+                  <div className="co-name">{article.title}</div>
+                </div>
+              )
+            })}
+          </div>
         </div>
       )}
 

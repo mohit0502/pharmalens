@@ -11,6 +11,7 @@ GET  /api/indication/{slug}        — indication wiki content + structured meta
 GET  /api/company/{slug}           — company wiki content + meta + live stock
 GET  /api/company/{slug}/trials    — structured trial data (parsed, not raw markdown)
 GET  /api/company/{slug}/events    — structured "Recent events" data (canonical CSV)
+GET  /api/company/{slug}/news      — BioSpace + yfinance news for one company, last 7 days
 GET  /api/news                     — BioSpace articles relevant to tracked companies
 GET  /api/news/article             — fetch + parse a single BioSpace article by URL
 POST /api/ask                      — Q&A agent, streams SSE
@@ -353,6 +354,17 @@ def get_news_article(url: str) -> dict:
         raise HTTPException(status_code=400, detail=str(e))
     except Exception as e:
         raise HTTPException(status_code=502, detail=f"Failed to fetch article: {e}")
+
+
+@app.get("/api/company/{slug}/news")
+def get_company_news_route(slug: str) -> dict:
+    """BioSpace + yfinance news for one company, last 7 days, newest first."""
+    if slug not in COMPANIES:
+        raise HTTPException(status_code=404, detail=f"Company '{slug}' not found")
+    try:
+        return {"articles": news.get_company_news(slug)}
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"Failed to fetch company news: {e}")
 
 
 # ── Q&A agent (SSE) ───────────────────────────────────────────────────────────

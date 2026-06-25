@@ -9,10 +9,12 @@ layer for the frontend's News section and the Q&A agent's article context.
 import json
 import re
 import time
+from datetime import datetime, timedelta, timezone
 import xml.etree.ElementTree as ET
 from pathlib import Path
 
 import requests
+import yfinance as yf
 from bs4 import BeautifulSoup
 
 BASE_DIR = Path(__file__).parent.parent
@@ -24,8 +26,11 @@ _NS = {"n": "http://www.sitemaps.org/schemas/sitemap/0.9", "news": "http://www.g
 
 _ARTICLES_CACHE_TTL = 900   # 15 min
 _ARTICLE_CACHE_TTL = 3600   # 1 hour
+_COMPANY_NEWS_CACHE_TTL = 900   # 15 min
+_COMPANY_NEWS_WINDOW_DAYS = 7   # yfinance + BioSpace combined, last week
 _articles_cache: tuple[float, list[dict]] | None = None
 _article_cache: dict[str, tuple[float, dict]] = {}
+_company_news_cache: dict[str, tuple[float, list[dict]]] = {}
 
 _REQUEST_HEADERS = {"User-Agent": "Mozilla/5.0 (compatible; PharmaLensBot/1.0)"}
 
@@ -119,3 +124,72 @@ def get_article(url: str) -> dict:
     }
     _article_cache[url] = (time.time(), result)
     return result
+
+
+def _yfinance_news_for_company(slug: str) -> list[dict]:
+    """yfinance's per-ticker news feed mixes in tangential market news (other
+    tickers it merely co-mentions), so re-apply the same alias match used for
+    BioSpace rather than trusting every item Yahoo attaches to this ticker."""
+    ticker = COMPANIES.get(slug, {}).get("ticker")
+    if not ticker:
+        return []
+    try:
+        raw_items = yf.Ticker(ticker).news
+    except Exception:
+        return []
+
+    results = []
+    for item in raw_items:
+        content = item.get("content", {})
+        title = content.get("title", "")
+        # Title-only match: Yahoo's per-ticker feed includes broader market news
+        # where the company is only mentioned incidentally in the summary (e.g.
+        # "X left Pfizer to become Y's new CFO" on a story that's actually about Y).
+        if slug not in _matching_companies(title):
+            continue
+        url = (content.get("canonicalUrl") or {}).get("url", "")
+        if not url:
+            continue
+        results.append({
+            "title": title,
+            "url": url,
+            "published_date": content.get("pubDate", ""),
+            "source": (content.get("provider") or {}).get("displayName", "Yahoo Finance"),
+            "companies": [slug],
+        })
+    return results
+
+
+def get_company_news(slug: str) -> list[dict]:
+    """Combined BioSpace + yfinance news for one company, newest first, capped
+    to the last _COMPANY_NEWS_WINDOW_DAYS. Cached per-company since both
+    upstream calls (sitemap fetch, yfinance) are network round-trips."""
+    cached = _company_news_cache.get(slug)
+    if cached and time.time() - cached[0] < _COMPANY_NEWS_CACHE_TTL:
+        return cached[1]
+
+    biospace_items = [
+        {**a, "source": "BioSpace"}
+        for a in get_relevant_articles()
+        if slug in a["companies"]
+    ]
+    yfinance_items = _yfinance_news_for_company(slug)
+
+    cutoff = datetime.now(timezone.utc) - timedelta(days=_COMPANY_NEWS_WINDOW_DAYS)
+    seen_urls = set()
+    combined = []
+    for item in biospace_items + yfinance_items:
+        if item["url"] in seen_urls:
+            continue
+        try:
+            published = datetime.fromisoformat(item["published_date"].replace("Z", "+00:00"))
+        except (ValueError, AttributeError):
+            continue
+        if published < cutoff:
+            continue
+        seen_urls.add(item["url"])
+        combined.append(item)
+
+    combined.sort(key=lambda a: a["published_date"], reverse=True)
+    _company_news_cache[slug] = (time.time(), combined)
+    return combined
