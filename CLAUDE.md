@@ -169,7 +169,7 @@ Validates entities against `reference/*.json`. Routes signals into four batch bu
 After the per-file loop, `flush_buffered_pages()` fires all entity page writes in parallel (up to 20 threads, one LLM call per entity, no pool-level timeout — each call is individually bounded by the 300s HTTP client timeout instead). Each entity receives ALL signals accumulated across the batch run. Files are only marked processed in state after a successful flush — but `mark_file_processed()` itself writes incrementally (one GCS round-trip per file, not one atomic batch at the end), so a run cancelled mid-flush still durably persists everything completed up to that point.
 
 **Gemini context caching:**
-`orchestrator.py` builds caches once per pipeline run — one per doc type present in the queue, one per wiki page type (always 5). Each cache contains system prompt + extraction or template content. Saves ~70% of token costs. Cache TTL is 30 hours (`108000s`). Model: `gemini-2.5-flash` for compiler + Q&A, `gemini-2.5-pro` for lint.
+`orchestrator.py` builds caches once per pipeline run — one per doc type present in the queue, one per wiki page type (always 5). Each cache contains system prompt + extraction or template content. Saves ~70% of token costs. Cache TTL is 3 hours (`10800s`) — enough to cover one daily compiler run with margin, short enough that a stale cache from the previous day isn't still being billed for storage by the time the next day's run creates a fresh one. (Previously 30 hours/`108000s`; that overlap was identified as the dominant driver of Vertex AI's "Input Text Caching Storage" cost in a billing review.) Model: `gemini-2.5-flash` for compiler + Q&A, `gemini-2.5-pro` for lint.
 
 ### State tracking (`agents/state.py`)
 
@@ -196,7 +196,12 @@ After the per-file loop, `flush_buffered_pages()` fires all entity page writes i
 
 Key routes:
 - `GET /api/company/{slug}/trials` — calls `api/tools.py:parse_company_trials()`, which parses the per-company trial wiki and computes stats. `_count_concluded_trials()` has specific logic: terminated/withdrawn always count; completed/active-not-recruiting only count if `primary_completion_date` falls within the lookback window.
-- `POST /api/ask` — streams SSE events: `tool_call`, `tool_result`, `text`, `done`. Q&A agent (`api/agent.py`) has **5 tools**: `read_wiki_page`, `list_wiki_pages`, `search_wiki`, `get_stock_price`, `get_company_trials`. The last one exists because reading `trials/{company}.md` directly as raw markdown gets truncated (tool results are capped at 30,000 chars) for companies with many trials — `get_company_trials` returns the same data as compact, pre-sorted (newest-first) JSON instead, sidestepping the truncation entirely.
+- `POST /api/ask` — streams SSE events: `tool_call`, `tool_result`, `text`, `done`. Q&A agent (`api/agent.py`) has **7 tools**: `read_wiki_page`, `list_wiki_pages`, `search_wiki`, `get_stock_price`, `get_stock_history`, `get_company_news`, `get_company_trials`. `get_company_trials` exists because reading `trials/{company}.md` directly gets truncated (tool results are capped at 30,000 chars) for companies with many trials — it returns the same data as compact, pre-sorted (newest-first) JSON instead. `get_company_news` and `get_stock_history` are for time-sensitive questions the static wiki can't answer.
+- `GET /api/company/{slug}/news` — proxies `api/news.py:get_company_news()` for the frontend news grid.
+- `GET /api/news` — proxies `api/news.py:get_relevant_articles()` for the sidebar feed.
+- `GET /api/article` — fetches and parses a single BioSpace article by URL; used for article-aware Q&A (the article body is injected into the agent's user message directly, not fetched by a tool).
+
+**`api/news.py`** — news read + cache layer (no LLM, no GCS). Fetches BioSpace's news sitemap to discover articles mentioning tracked companies; fetches individual article pages on demand. Also combines BioSpace + Yahoo Finance news for `get_company_news()`. Three in-process caches: articles list (15 min TTL), individual article bodies (1 hr), per-company combined feed (15 min). All stock tools in `api/tools.py` accept a company slug and resolve to a ticker internally via `resolve_ticker()` — callers never pass tickers directly.
 
 ### Frontend (`frontend/src/`)
 

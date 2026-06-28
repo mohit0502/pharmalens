@@ -685,7 +685,7 @@ def _clinical_finding_matches_drug(extracted: dict, drug_slug: str) -> bool:
     guessing, since attributing a finding to the wrong drug's page (a quiet
     factual error) is worse than skipping it (a logged, retried gap)."""
     cf = extracted.get("clinical_findings")
-    if not cf:
+    if not cf or not isinstance(cf, dict):
         return False
     subject = (cf.get("subject_drug") or "").strip().lower()
     slug = drug_slug.strip().lower()
@@ -725,6 +725,7 @@ def _extract_clinical_findings(pubmed_results_text: str) -> dict | None:
             temperature=0.1,
             response_mime_type="application/json",
             response_schema=ClinicalFindings,
+            thinking_config=types.ThinkingConfig(thinking_budget=0),
         ),
     )
     ledger.record(response.usage_metadata)
@@ -824,10 +825,17 @@ def compile_document_step1(
     raw_content: str,
     doc_type: str,
     system_prompt: str,
+    cache_name: str | None = None,
 ) -> dict:
     """Step 1 — extract structured entities and signals from the raw document.
     One LLM call. Returns parsed JSON dict.
-    system_prompt is passed in by compile_document (built once, or from cache).
+
+    system_prompt is the full text (built once by compile_document) — always
+    passed, used as a fallback. cache_name, when set, is used instead via the
+    `cached_content` field (previously this was sent as a literal
+    `system_instruction` string, i.e. the cache was created and billed for
+    storage but never actually applied to this call — see the
+    `extraction_caches`/`build_extraction_caches` path in orchestrator.py).
     """
     step1_prompt = f"""Document to process:
 ---
@@ -891,15 +899,27 @@ null when the finding truly can't be attributed to one drug.
 Return ONLY valid JSON with no markdown fences.
 """
 
-    step1_response = client.models.generate_content(
-        model=FLASH_MODEL,
-        contents=step1_prompt,
-        config=types.GenerateContentConfig(
+    if cache_name:
+        step1_config = types.GenerateContentConfig(
+            cached_content=cache_name,
+            temperature=0.1,
+            response_mime_type="application/json",
+            response_schema=ExtractionResult,
+            thinking_config=types.ThinkingConfig(thinking_budget=0),
+        )
+    else:
+        step1_config = types.GenerateContentConfig(
             system_instruction=system_prompt,
             temperature=0.1,
             response_mime_type="application/json",
             response_schema=ExtractionResult,
-        ),
+            thinking_config=types.ThinkingConfig(thinking_budget=0),
+        )
+
+    step1_response = client.models.generate_content(
+        model=FLASH_MODEL,
+        contents=step1_prompt,
+        config=step1_config,
     )
     ledger.record(step1_response.usage_metadata)
 
@@ -927,16 +947,25 @@ def collect_entity_pages(
     Returns True if any tracked entity was found.
     """
     # enrich all_drugs_mentioned with is_tracked flag (set here in Python, not by LLM)
-    all_drugs = extracted.get("all_drugs_mentioned", [])
-    for drug in all_drugs:
+    # Each entry is expected to be a dict (per the DrugMention schema), but this
+    # has been hit by malformed/legacy-shaped entries in production (logged as
+    # "'str' object has no attribute 'get'") — drop anything that isn't a dict
+    # rather than crashing the whole file's processing over one bad entry.
+    all_drugs_raw = extracted.get("all_drugs_mentioned", []) or []
+    all_drugs = []
+    for drug in all_drugs_raw:
+        if not isinstance(drug, dict):
+            logger.warning(f"STEP2 | SKIP DRUG MENTION | not a dict, got {type(drug).__name__}: {drug!r}")
+            continue
         drug["is_tracked"] = drug.get("name", "") in DRUGS
+        all_drugs.append(drug)
     extracted["all_drugs_mentioned"] = all_drugs
 
     # derive tracked drug names for page routing
     tracked_drug_names = [d["name"] for d in all_drugs if d.get("is_tracked")]
 
     # fallback: if LLM missed the company, inject from path context
-    companies_mentioned = extracted.get("companies_mentioned", [])
+    companies_mentioned = [c for c in (extracted.get("companies_mentioned", []) or []) if isinstance(c, str)]
     if not companies_mentioned and context.get("company") in COMPANIES:
         logger.warning(
             f"STEP2 | companies_mentioned empty — "
@@ -966,7 +995,7 @@ def collect_entity_pages(
             "path_fn":   lambda e: f"indications/{e}/_index.md",
             "type":      "indication_hub",
             "ref_name":  "reference/indications.json",
-            "entities":  extracted.get("indications_mentioned", []),
+            "entities":  [e for e in (extracted.get("indications_mentioned", []) or []) if isinstance(e, str)],
             "buffer":    indication_buffer,
         },
     ]
@@ -980,6 +1009,9 @@ def collect_entity_pages(
 
     for config in entity_configs:
         for entity in config["entities"]:
+            if not isinstance(entity, str):
+                logger.warning(f"STEP2 | SKIP ENTITY | non-string {config['type']} mention: {entity!r}")
+                continue
             normalized = entity if entity in config["reference"] else entity.lower()
 
             # fall back to alias maps when the LLM returns a name instead of a slug
@@ -1031,14 +1063,14 @@ def collect_trial_and_event_pages(
 
     found_any = False
 
-    for nct_id in extracted.get("trial_ids", []):
-        if not (nct_id.startswith("NCT") and len(nct_id) == 11):
-            logger.warning(f"STEP2 | SKIP ENTITY | Malformed trial ID: '{nct_id}'")
+    for nct_id in extracted.get("trial_ids", []) or []:
+        if not isinstance(nct_id, str) or not (nct_id.startswith("NCT") and len(nct_id) == 11):
+            logger.warning(f"STEP2 | SKIP ENTITY | Malformed trial ID: {nct_id!r}")
             continue
 
         primary_sponsor = next(
-            (c for c in extracted.get("companies_mentioned", [])
-             if c in COMPANIES or c.lower() in COMPANIES),
+            (c for c in (extracted.get("companies_mentioned", []) or [])
+             if isinstance(c, str) and (c in COMPANIES or c.lower() in COMPANIES)),
             None,
         )
         if primary_sponsor and primary_sponsor not in COMPANIES:
@@ -1198,12 +1230,16 @@ Rules:
 """
         cache_name = template_caches.get(page["type"])
         if cache_name:
-            config = types.GenerateContentConfig(cached_content=cache_name, temperature=0.2)
+            config = types.GenerateContentConfig(
+                cached_content=cache_name, temperature=0.2,
+                thinking_config=types.ThinkingConfig(thinking_budget=0),
+            )
         else:
             page_template = load_page_template(page["type"])
             config = types.GenerateContentConfig(
                 system_instruction=system_prompt + "\n\n" + page_template,
                 temperature=0.2,
+                thinking_config=types.ThinkingConfig(thinking_budget=0),
             )
         tasks.append((page, prompt, config))
 
@@ -1711,11 +1747,13 @@ def flush_buffered_pages(
         if cache_name:
             return types.GenerateContentConfig(
                 cached_content=cache_name, temperature=0.2, max_output_tokens=MAX_OUTPUT_TOKENS,
+                thinking_config=types.ThinkingConfig(thinking_budget=0),
             )
         page_template = load_page_template(page_type)
         return types.GenerateContentConfig(
             system_instruction=system_prompt + "\n\n" + page_template,
             temperature=0.2, max_output_tokens=MAX_OUTPUT_TOKENS,
+            thinking_config=types.ThinkingConfig(thinking_budget=0),
         )
 
     def _chunk_note(chunk_index: int, total_chunks: int) -> str:
@@ -2398,11 +2436,10 @@ def compile_document(
                 extracted["clinical_findings"] = findings
                 logger.info(f"STEP1 | CLINICAL_FINDINGS | {file_name} — extracted from pubmed_results")
     else:
-        cache_name   = extraction_caches.get(doc_type)
-        step1_system = cache_name if cache_name else system_prompt
+        cache_name = extraction_caches.get(doc_type)
         try:
             extracted = compile_document_step1(
-                file_path, context, raw_content, doc_type, step1_system,
+                file_path, context, raw_content, doc_type, system_prompt, cache_name,
             )
         except ValueError as e:
             logger.error(f"STEP1 | FAILED | {file_name}: {e}")

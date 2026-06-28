@@ -53,7 +53,7 @@ logger = get_logger("pharmalens.orchestrator")
 
 # ── cache builders ────────────────────────────────────────────────────────────
 
-def create_cache(system_prompt: str, label: str, ttl: str = "108000s") -> str:
+def create_cache(system_prompt: str, label: str, ttl: str = "10800s") -> str:
     """Create a single Gemini context cache and return its name."""
     cache = client.caches.create(
         model=FLASH_MODEL,
