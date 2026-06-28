@@ -330,9 +330,34 @@ async def run_agent(
         except Exception:
             pass
     if indication:
-        context_lines.append(f"User is currently viewing indication: {indication}")
+        # Deterministically inject the indication hub page instead of relying
+        # on the model to choose to call read_wiki_page for it — it's a known,
+        # fixed path given this context, so there's no decision to make.
+        # (Skipping read_wiki_page here was the AbbVie-earnings failure mode:
+        # the model went straight to search_wiki with a verbose query instead
+        # of just reading the page it already knew the path to.)
+        page = read_wiki_page(f"indications/{indication}/_index.md")
+        if not page.startswith("Page not found"):
+            context_lines.append(
+                f"User is currently viewing indication '{indication}'. "
+                f"Here is its wiki page (indications/{indication}/_index.md) — "
+                f"already fetched, no need to read_wiki_page it again unless "
+                f"you need a different page:\n{page[:10000]}"
+            )
+        else:
+            context_lines.append(f"User is currently viewing indication: {indication}")
     if company:
-        context_lines.append(f"User is currently viewing company: {company}")
+        page = read_wiki_page(f"companies/{company}.md")
+        if not page.startswith("Page not found"):
+            context_lines.append(
+                f"User is currently viewing company '{company}'. "
+                f"Here is its wiki page (companies/{company}.md) — already "
+                f"fetched, no need to read_wiki_page it again unless you need "
+                f"a different page (e.g. drugs/<drug>.md, trials/{company}.md, "
+                f"or get_company_trials/get_company_news for more detail):\n{page[:10000]}"
+            )
+        else:
+            context_lines.append(f"User is currently viewing company: {company}")
 
     user_text = ("\n".join(context_lines) + "\n\n" if context_lines else "") + question
 

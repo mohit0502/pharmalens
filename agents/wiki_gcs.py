@@ -20,6 +20,7 @@ Environment variables (all optional in dev):
 """
 
 import os
+import re
 import time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
@@ -180,17 +181,60 @@ def list_wiki(prefix: str = "") -> list[str]:
     )
 
 
-def search_wiki(query: str, prefix: str = "") -> list[dict]:
-    """Full-text search across wiki pages. Returns [{path, snippet}] up to 20 matches.
+# Dropped from queries before token-matching — common in natural-language
+# phrasing ("summarize the Q1 earnings call for AbbVie") but never literally
+# present in the wiki's own phrasing, so requiring them as a literal substring
+# (the old behavior) made verbose questions fail to match content that
+# obviously covers the topic. Keeping numbers/codes (e.g. "q1") since those
+# often do appear verbatim and are informative.
+_SEARCH_STOPWORDS = {
+    "the", "a", "an", "of", "for", "and", "or", "to", "in", "on", "is", "are",
+    "was", "were", "what", "summarize", "tell", "me", "about", "please", "can",
+    "you", "give", "show", "explain", "describe", "this", "that", "with",
+}
 
-    A query with no literal match anywhere in the wiki (common — the Q&A agent
+
+def _tokenize_query(query: str) -> list[str]:
+    """Lowercase, split on non-word chars, drop stopwords/single-char tokens.
+    Falls back to the raw lowercased query as one token if everything was
+    filtered out (e.g. a query that's nothing but stopwords) so a search
+    never silently matches every page."""
+    tokens = [t for t in re.split(r"\W+", query.lower()) if t]
+    meaningful = [t for t in tokens if t not in _SEARCH_STOPWORDS and len(t) > 1]
+    return meaningful or tokens or [query.lower()]
+
+
+def _score_match(content_lower: str, tokens: list[str], rel: str = "") -> int:
+    """Score = count of query tokens present in the page body, plus a heavy
+    bonus per token that also appears in the page's own path/filename.
+
+    Body-only presence is too weak on its own: common words in the query
+    ("first", "call") incidentally show up somewhere in almost every
+    long page, so a generic page can rack up the same token-presence count as
+    the one page that's actually about the query (e.g. a long drug page
+    mentioning "first-line" and a conference "call" elsewhere scores as high
+    as the company's own earnings page). The path bonus breaks that tie in
+    favor of the page whose filename matches the query's subject — exactly
+    the case of "abbvie earnings" naturally preferring companies/abbvie.md."""
+    body_score = sum(1 for t in tokens if t in content_lower)
+    path_lower = rel.lower()
+    path_bonus = sum(3 for t in tokens if t in path_lower) if rel else 0
+    return body_score + path_bonus
+
+
+def search_wiki(query: str, prefix: str = "") -> list[dict]:
+    """Full-text search across wiki pages, ranked by how many query tokens
+    each page matches. Returns [{path, snippet}], best matches first, capped
+    at 20.
+
+    A query with no match anywhere in the wiki (common — the Q&A agent
     sometimes searches for things that simply aren't in any page, e.g. transient
-    stock-price commentary) can't early-exit on the 20-match cap, so it always
-    has to read every page. In production that's hundreds of GCS round-trips;
-    done serially this took minutes and looked indistinguishable from a hang.
-    Read them concurrently instead."""
-    query_lower = query.lower()
-    results: list[dict] = []
+    stock-price commentary) can't early-exit, so it always has to read every
+    page. In production that's hundreds of GCS round-trips; done serially this
+    took minutes and looked indistinguishable from a hang. Read them
+    concurrently instead."""
+    tokens = _tokenize_query(query)
+    scored: list[tuple[int, dict]] = []
 
     if _gcs_enabled():
         # Route through list_wiki()/read_wiki() instead of raw blob calls — both
@@ -203,12 +247,14 @@ def search_wiki(query: str, prefix: str = "") -> list[dict]:
         with ThreadPoolExecutor(max_workers=40) as pool:
             contents = pool.map(read_wiki, paths)
         for rel, content in zip(paths, contents):
-            if not content or query_lower not in content.lower():
+            if not content:
                 continue
-            _append_snippet(results, rel, content, query_lower)
-            if len(results) >= 20:
-                break
-        return results
+            score = _score_match(content.lower(), tokens, rel)
+            if score == 0:
+                continue
+            scored.append((score, {"path": rel, "snippet": _best_snippet(content, tokens)}))
+        scored.sort(key=lambda x: x[0], reverse=True)
+        return [r for _, r in scored[:20]]
 
     # local fallback
     search_dir = LOCAL_WIKI_DIR / prefix if prefix else LOCAL_WIKI_DIR
@@ -221,13 +267,13 @@ def search_wiki(query: str, prefix: str = "") -> list[dict]:
             content = p.read_text()
         except Exception:
             continue
-        if query_lower not in content.lower():
-            continue
         rel = str(p.relative_to(LOCAL_WIKI_DIR))
-        _append_snippet(results, rel, content, query_lower)
-        if len(results) >= 20:
-            break
-    return results
+        score = _score_match(content.lower(), tokens, rel)
+        if score == 0:
+            continue
+        scored.append((score, {"path": rel, "snippet": _best_snippet(content, tokens)}))
+    scored.sort(key=lambda x: x[0], reverse=True)
+    return [r for _, r in scored[:20]]
 
 
 def search_paths(query: str, paths: list[str]) -> list[dict]:
@@ -235,30 +281,41 @@ def search_paths(query: str, paths: list[str]) -> list[dict]:
     every page in the wiki) — for cases where the caller already knows which
     pages are relevant (e.g. one company's page/trials/drugs/events) and a full
     search_wiki() scan would be needlessly slow. Returns [{path, snippet}],
-    no cap since the path list is already small."""
-    query_lower = query.lower()
-    results: list[dict] = []
+    ranked best-match first, no cap since the path list is already small."""
+    tokens = _tokenize_query(query)
+    scored: list[tuple[int, dict]] = []
     paths = [p for p in dict.fromkeys(paths)]  # dedup, preserve order
     if not paths:
-        return results
+        return []
     with ThreadPoolExecutor(max_workers=min(10, len(paths))) as pool:
         contents = pool.map(read_wiki, paths)
     for rel, content in zip(paths, contents):
-        if not content or query_lower not in content.lower():
+        if not content:
             continue
-        _append_snippet(results, rel, content, query_lower)
-    return results
+        score = _score_match(content.lower(), tokens, rel)
+        if score == 0:
+            continue
+        scored.append((score, {"path": rel, "snippet": _best_snippet(content, tokens)}))
+    scored.sort(key=lambda x: x[0], reverse=True)
+    return [r for _, r in scored]
 
 
-def _append_snippet(results: list[dict], rel: str, content: str, query_lower: str) -> None:
+def _best_snippet(content: str, tokens: list[str]) -> str:
+    """Pick the line that matches the most query tokens (ties broken by
+    earliest line), with a couple lines of surrounding context — better than
+    snapping to the first token's first occurrence when the query has several
+    tokens scattered across the page."""
     lines = content.splitlines()
+    best_idx, best_count = 0, -1
     for i, line in enumerate(lines):
-        if query_lower in line.lower():
-            start = max(0, i - 1)
-            end = min(len(lines), i + 3)
-            snippet = "\n".join(lines[start:end]).strip()
-            results.append({"path": rel, "snippet": snippet[:400]})
-            return
+        line_lower = line.lower()
+        count = sum(1 for t in tokens if t in line_lower)
+        if count > best_count:
+            best_idx, best_count = i, count
+    start = max(0, best_idx - 1)
+    end = min(len(lines), best_idx + 3)
+    snippet = "\n".join(lines[start:end]).strip()
+    return snippet[:400]
 
 
 # ── generic append-only CSV log (GCS-backed when GCS_MODE=true) ──────────────
