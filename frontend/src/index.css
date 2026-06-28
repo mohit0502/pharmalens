@@ -497,7 +497,18 @@ body {
   font-size: 14px;
   line-height: 1.6;
   color: #dde1f0;
-  white-space: pre-wrap;
+}
+
+.ai-text p { margin: 0 0 10px; }
+.ai-text p:last-child { margin-bottom: 0; }
+.ai-text ul, .ai-text ol { margin: 0 0 10px; padding-left: 20px; }
+.ai-text li { margin-bottom: 4px; }
+.ai-text strong { color: #f0f2fa; font-weight: 600; }
+.ai-text code {
+  background: #1a2035;
+  border-radius: 4px;
+  padding: 1px 5px;
+  font-size: 12.5px;
 }
 
 .ai-thinking {

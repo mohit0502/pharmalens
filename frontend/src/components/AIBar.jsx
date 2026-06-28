@@ -1,4 +1,5 @@
 import { useState, useRef, useEffect } from 'react'
+import ReactMarkdown from 'react-markdown'
 import { streamAsk } from '../api'
 
 const SparkIcon = () => (
@@ -127,7 +128,11 @@ export default function AIBar({ indication, company, article, displayName }) {
                   {entry.streaming && !entry.answer && (
                     <div className="ai-thinking">Thinking…</div>
                   )}
-                  {entry.answer && <div className="ai-text">{entry.answer}</div>}
+                  {entry.answer && (
+                    <div className="ai-text">
+                      <ReactMarkdown>{entry.answer}</ReactMarkdown>
+                    </div>
+                  )}
                 </div>
               </div>
             ))}
