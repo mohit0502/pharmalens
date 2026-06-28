@@ -361,10 +361,16 @@ body {
 }
 
 .ai-panel-header {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 8px;
   padding: 18px 16px 12px;
   border-bottom: 0.5px solid #252b3b;
   flex-shrink: 0;
 }
+
+.ai-panel-header-text { min-width: 0; }
 
 .ai-panel-title {
   font-size: 15px;
@@ -377,6 +383,19 @@ body {
   font-size: 11px;
   color: #7a8099;
 }
+
+.ai-clear-btn {
+  flex-shrink: 0;
+  background: none;
+  border: none;
+  padding: 2px 0;
+  font-size: 11px;
+  color: #7a8099;
+  cursor: pointer;
+  transition: color 0.1s;
+}
+.ai-clear-btn:hover:not(:disabled) { color: #a8d1ff; }
+.ai-clear-btn:disabled { opacity: 0.5; cursor: default; }
 
 .ai-section {
   display: flex;

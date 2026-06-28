@@ -341,11 +341,17 @@ def get_company_news_route(slug: str) -> dict:
 # ── Q&A agent (SSE) ───────────────────────────────────────────────────────────
 
 
+class ChatTurn(BaseModel):
+    question: str
+    answer: str
+
+
 class AskRequest(BaseModel):
     question: str
     indication: str | None = None
     company: str | None = None
     article: str | None = None
+    history: list[ChatTurn] = []
 
 
 @app.post("/api/ask")
@@ -358,10 +364,18 @@ async def ask(body: AskRequest) -> StreamingResponse:
       tool_result — tool returned (first 300 chars shown)
       text        — model text chunk
       done        — stream complete; full_text contains the assembled answer
+
+    `history` carries prior turns from the same browser-side chat session (the
+    frontend holds it in React state, cleared on refresh or "Clear chat") so
+    follow-up questions like "tell me more about X" have the prior exchange as
+    context — the backend itself is stateless across requests.
     """
 
     async def event_stream():
-        async for event in run_agent(body.question, body.indication, body.company, body.article):
+        history = [t.model_dump() for t in body.history]
+        async for event in run_agent(
+            body.question, body.indication, body.company, body.article, history
+        ):
             yield f"data: {json.dumps(event)}\n\n"
 
     return StreamingResponse(event_stream(), media_type="text/event-stream")

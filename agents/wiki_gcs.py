@@ -230,6 +230,26 @@ def search_wiki(query: str, prefix: str = "") -> list[dict]:
     return results
 
 
+def search_paths(query: str, paths: list[str]) -> list[dict]:
+    """Full-text search over an explicit, bounded list of page paths (instead of
+    every page in the wiki) — for cases where the caller already knows which
+    pages are relevant (e.g. one company's page/trials/drugs/events) and a full
+    search_wiki() scan would be needlessly slow. Returns [{path, snippet}],
+    no cap since the path list is already small."""
+    query_lower = query.lower()
+    results: list[dict] = []
+    paths = [p for p in dict.fromkeys(paths)]  # dedup, preserve order
+    if not paths:
+        return results
+    with ThreadPoolExecutor(max_workers=min(10, len(paths))) as pool:
+        contents = pool.map(read_wiki, paths)
+    for rel, content in zip(paths, contents):
+        if not content or query_lower not in content.lower():
+            continue
+        _append_snippet(results, rel, content, query_lower)
+    return results
+
+
 def _append_snippet(results: list[dict], rel: str, content: str, query_lower: str) -> None:
     lines = content.splitlines()
     for i, line in enumerate(lines):

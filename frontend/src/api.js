@@ -58,7 +58,7 @@ export async function fetchArticle(url) {
 }
 
 // POST /api/ask — returns an async generator of SSE event objects
-export async function* streamAsk(question, indication, company, article) {
+export async function* streamAsk(question, indication, company, article, history = []) {
   const response = await fetch(`${BASE}/api/ask`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
@@ -67,6 +67,7 @@ export async function* streamAsk(question, indication, company, article) {
       indication: indication || null,
       company: company || null,
       article: article || null,
+      history,
     }),
   })
 

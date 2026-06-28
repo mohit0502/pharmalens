@@ -15,6 +15,7 @@ function toolLabel(name, input) {
   if (name === 'get_stock_history') return `Fetching ${input.period ?? '1mo'} history for ${input.company_slug}…`
   if (name === 'get_company_news') return `Fetching news for ${input.company_slug}…`
   if (name === 'search_wiki') return `Searching wiki for "${input.query}"…`
+  if (name === 'search_company_wiki') return `Searching ${input.company_slug} for "${input.query}"…`
   return name
 }
 
@@ -43,11 +44,18 @@ export default function AIBar({ indication, company, article, displayName }) {
     setStreaming(true)
     setQuestion('')
 
+    // Prior turns sent to the backend as context — only the question/answer
+    // text, not tool calls, since that's all the backend's contents-builder
+    // replays (see api/agent.py:run_agent).
+    const priorTurns = history
+      .filter(entry => entry.answer && !entry.streaming)
+      .map(entry => ({ question: entry.question, answer: entry.answer }))
+
     // Append new entry — keep all previous entries intact
     setHistory(prev => [...prev, { question: q, toolCalls: [], answer: '', streaming: true }])
 
     try {
-      for await (const event of streamAsk(q, indication ?? null, company ?? null, article ?? null)) {
+      for await (const event of streamAsk(q, indication ?? null, company ?? null, article ?? null, priorTurns)) {
         if (event.type === 'tool_call') {
           updateLast(entry => ({
             ...entry,
@@ -82,8 +90,21 @@ export default function AIBar({ indication, company, article, displayName }) {
   return (
     <div className="ai-panel">
       <div className="ai-panel-header">
-        <div className="ai-panel-title">Research</div>
-        <div className="ai-panel-context">{contextLabel}</div>
+        <div className="ai-panel-header-text">
+          <div className="ai-panel-title">Research</div>
+          <div className="ai-panel-context">{contextLabel}</div>
+        </div>
+        {history.length > 0 && (
+          <button
+            type="button"
+            className="ai-clear-btn"
+            onClick={() => setHistory([])}
+            disabled={streaming}
+            title="Clear chat"
+          >
+            Clear chat
+          </button>
+        )}
       </div>
 
       <div className="ai-section">

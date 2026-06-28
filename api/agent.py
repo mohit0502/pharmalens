@@ -22,7 +22,7 @@ from google.genai import types
 from . import news
 from .tools import (
     read_wiki_page, list_wiki_pages, get_stock_price, get_stock_history,
-    search_wiki, parse_company_trials, resolve_ticker,
+    search_wiki, search_company_wiki, parse_company_trials, resolve_ticker,
 )
 
 load_dotenv()
@@ -43,6 +43,7 @@ Wiki layout:
 Instructions:
 1. Always look up relevant wiki pages before answering. Start with read_wiki_page for known paths.
 2. When you don't know the exact path (e.g. looking for an earnings event, NCT number, or specific drug mention), use search_wiki first — it returns matching file paths and snippets so you can then read_wiki_page the right file.
+   - If the term is a drug/product name that isn't in the wiki's drug pages (read_wiki_page on drugs/<name>.md returns "Page not found") AND you know which company it belongs to (from context, or because search_wiki's snippets mention the company), use search_company_wiki(company_slug, query) instead of repeating search_wiki — it scans only that company's own page, trials, drugs, and events, so it stays fast and still surfaces real coverage (e.g. earnings calls, event log entries) even for a drug too new or niche to have its own tracked page.
 3. For any question about a company's clinical trials (which trials, which indications, dates, status, results), use get_company_trials instead of read_wiki_page on trials/<company>.md — that file can hold 50+ trials and gets cut off well before recent ones, while get_company_trials returns the full structured list pre-sorted newest-first.
 4. Quote specific numbers, dates, and drug names from the wiki — do not hallucinate.
 5. All stock/news tools take a company_slug (e.g. 'eli-lilly', 'novo-nordisk') — you never need to know or ask for a ticker symbol.
@@ -198,6 +199,32 @@ TOOL_DECLARATIONS = types.Tool(
                 required=["query"],
             ),
         ),
+        types.FunctionDeclaration(
+            name="search_company_wiki",
+            description=(
+                "Full-text search scoped to one company's own pages — its company page, "
+                "trial roster, drug pages, and event log — instead of the entire wiki. "
+                "Use this for a drug/term that isn't found via read_wiki_page (no dedicated "
+                "drug page exists, e.g. a niche or newly-launched product) when you already "
+                "know which company it belongs to. Much faster than search_wiki for sparse "
+                "terms since it's bounded to a handful of files, and still finds real coverage "
+                "in that company's earnings commentary or event history."
+            ),
+            parameters=types.Schema(
+                type=types.Type.OBJECT,
+                properties={
+                    "company_slug": types.Schema(
+                        type=types.Type.STRING,
+                        description="Company slug, e.g. 'vertex', 'eli-lilly'",
+                    ),
+                    "query": types.Schema(
+                        type=types.Type.STRING,
+                        description="Search term, e.g. 'casgevy'",
+                    ),
+                },
+                required=["company_slug", "query"],
+            ),
+        ),
     ]
 )
 
@@ -224,6 +251,9 @@ def _dispatch(name: str, args: dict) -> str:
     if name == "search_wiki":
         result = search_wiki(args.get("query", ""), args.get("prefix", ""))
         return json.dumps(result)
+    if name == "search_company_wiki":
+        result = search_company_wiki(args.get("company_slug", ""), args.get("query", ""))
+        return json.dumps(result)
     if name == "get_company_trials":
         trials = parse_company_trials(args.get("company_slug", ""))
         # Drop internal-only fields the LLM doesn't need; keep the rest compact.
@@ -235,6 +265,41 @@ def _dispatch(name: str, args: dict) -> str:
     return f"Unknown tool: {name}"
 
 
+# ── system-prompt context cache ────────────────────────────────────────────────
+# Same client.caches.create() pattern as agents/orchestrator.py:create_cache —
+# one cache shared by every request on this process, not per-user-session
+# (Gemini caching is content-scoped, not session-scoped). Saves resending the
+# ~600-token system prompt on every turn of every conversation. Built lazily
+# on first use rather than at import time so a transient Gemini error on
+# module load doesn't take down the whole API process.
+_SYSTEM_CACHE_TTL = "3600s"
+_system_cache_name: str | None = None
+_system_cache_checked = False
+
+
+def _get_system_cache_name() -> str | None:
+    """Returns the cache name to pass as `cached_content`, or None to fall back
+    to passing system_instruction directly. None is also the permanent outcome
+    if creation fails once — e.g. the prompt is below Gemini's minimum token
+    count for caching — so we don't retry a doomed call on every request."""
+    global _system_cache_name, _system_cache_checked
+    if _system_cache_checked:
+        return _system_cache_name
+    _system_cache_checked = True
+    try:
+        cache = client.caches.create(
+            model=FLASH_MODEL,
+            config=types.CreateCachedContentConfig(
+                system_instruction=SYSTEM_PROMPT,
+                ttl=_SYSTEM_CACHE_TTL,
+            ),
+        )
+        _system_cache_name = cache.name
+    except Exception:
+        _system_cache_name = None
+    return _system_cache_name
+
+
 # ── agent loop ────────────────────────────────────────────────────────────────
 
 async def run_agent(
@@ -242,8 +307,14 @@ async def run_agent(
     indication: str | None = None,
     company: str | None = None,
     article: str | None = None,
+    history: list[dict] | None = None,
 ) -> AsyncGenerator[dict, None]:
-    """Async generator that runs the agentic loop and yields SSE event dicts."""
+    """Async generator that runs the agentic loop and yields SSE event dicts.
+
+    `history` is prior {question, answer} turns from the same browser-side
+    chat (see api/main.py:AskRequest) — replayed into `contents` so follow-up
+    questions have the earlier exchange as context. The backend itself holds
+    no session state between HTTP requests."""
 
     # Build user message with optional context hint
     context_lines = []
@@ -265,9 +336,28 @@ async def run_agent(
 
     user_text = ("\n".join(context_lines) + "\n\n" if context_lines else "") + question
 
-    contents: list[types.Content] = [
-        types.Content(role="user", parts=[types.Part(text=user_text)])
-    ]
+    # Replay prior turns first so the model has the earlier exchange as
+    # context — tool calls from previous turns aren't replayed, just the
+    # final question/answer text, which is all the frontend retains anyway.
+    contents: list[types.Content] = []
+    for turn in (history or []):
+        prior_q, prior_a = turn.get("question", ""), turn.get("answer", "")
+        if not prior_q or not prior_a:
+            continue
+        contents.append(types.Content(role="user", parts=[types.Part(text=prior_q)]))
+        contents.append(types.Content(role="model", parts=[types.Part(text=prior_a)]))
+    contents.append(types.Content(role="user", parts=[types.Part(text=user_text)]))
+
+    cache_name = _get_system_cache_name()
+    config_kwargs = dict(
+        tools=[TOOL_DECLARATIONS],
+        temperature=0.2,
+        thinking_config=types.ThinkingConfig(thinking_budget=2048),
+    )
+    if cache_name:
+        config_kwargs["cached_content"] = cache_name
+    else:
+        config_kwargs["system_instruction"] = SYSTEM_PROMPT
 
     full_text_parts: list[str] = []
 
@@ -277,12 +367,7 @@ async def run_agent(
                 client.aio.models.generate_content(
                     model=FLASH_MODEL,
                     contents=contents,
-                    config=types.GenerateContentConfig(
-                        system_instruction=SYSTEM_PROMPT,
-                        tools=[TOOL_DECLARATIONS],
-                        temperature=0.2,
-                        thinking_config=types.ThinkingConfig(thinking_budget=2048),
-                    ),
+                    config=types.GenerateContentConfig(**config_kwargs),
                 ),
                 timeout=60,
             )

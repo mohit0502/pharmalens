@@ -8,8 +8,30 @@ import re
 import time
 import yfinance as yf
 import yaml
-from agents.wiki_gcs import read_wiki, list_wiki, search_wiki as _search_wiki, read_company_events
+import json
+from pathlib import Path
+
+from agents.wiki_gcs import (
+    read_wiki, list_wiki, search_wiki as _search_wiki, search_paths, read_company_events,
+)
 from .news import COMPANIES
+
+_REFERENCE_DIR = Path(__file__).parent.parent / "reference"
+_DRUGS_BY_COMPANY: dict[str, list[str]] | None = None
+
+
+def _drugs_for_company(slug: str) -> list[str]:
+    """INNs of drugs tracked under this company in reference/drugs.json.
+    Loaded once and cached for the life of the process — the reference file
+    only changes via a deploy, never at runtime."""
+    global _DRUGS_BY_COMPANY
+    if _DRUGS_BY_COMPANY is None:
+        drugs = json.loads((_REFERENCE_DIR / "drugs.json").read_text())
+        by_company: dict[str, list[str]] = {}
+        for inn, meta in drugs.items():
+            by_company.setdefault(meta.get("company", ""), []).append(inn)
+        _DRUGS_BY_COMPANY = by_company
+    return _DRUGS_BY_COMPANY.get(slug, [])
 
 _STOCK_CACHE_TTL_SECONDS = 20
 _stock_cache: dict[str, tuple[float, dict]] = {}
@@ -125,6 +147,42 @@ def list_wiki_pages(prefix: str = "") -> list[str]:
 def search_wiki(query: str, prefix: str = "") -> list[dict]:
     """Full-text search across wiki files. Returns [{path, snippet}] up to 20 matches."""
     return _search_wiki(query, prefix)
+
+
+def search_company_wiki(company_slug: str, query: str) -> list[dict]:
+    """Full-text search scoped to one company's known pages — its company page,
+    trial roster, drug pages, and event log entries — instead of every page in
+    the wiki. Exists for terms that won't be found via read_wiki_page (e.g. a
+    drug not yet in reference/drugs.json, like Casgevy for Vertex) but that
+    still show up in plain-text coverage of that company: company-wide
+    search_wiki() has to scan the entire (multi-thousand-page) wiki to find a
+    sparse, scattered term and can blow the tool-call timeout, whereas this is
+    bounded to a handful of files and stays fast regardless of wiki size."""
+    paths = [f"companies/{company_slug}.md", f"trials/{company_slug}.md"]
+    paths += [f"drugs/{inn}.md" for inn in _drugs_for_company(company_slug)]
+
+    # Event pages aren't named by a fixed slug pattern (e.g. both
+    # "vertex-pharmaceuticals-..." and "vertex-..." exist for the same
+    # company) — match on any sufficiently distinctive token from the slug.
+    tokens = [t for t in company_slug.split("-") if len(t) > 3]
+    if tokens:
+        for path in list_wiki("events"):
+            if any(t in path for t in tokens):
+                paths.append(path)
+
+    results = search_paths(query, paths)
+    # The events the company-events CSV log already has on file (separate from
+    # the wiki pages above) are the canonical source for the page's own
+    # "Recent events" table — surface a direct match there too in case the
+    # term appears in event text but not in the underlying markdown files.
+    query_lower = query.lower()
+    for row in read_company_events(company_slug):
+        if query_lower in row.get("event", "").lower():
+            results.append({
+                "path": f"company_events/{company_slug}",
+                "snippet": f"{row.get('date', '')}: {row.get('event', '')}",
+            })
+    return results
 
 
 def get_stock_price(ticker: str) -> dict:
